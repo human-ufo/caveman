@@ -26,12 +26,16 @@ function fixture(t, source = sources) {
 function run(surface, item, action) {
   const script = join(item.source, `${action}.${surface.extension}`);
   const args = surface.extension === 'ps1' ? ['-NoProfile', '-NonInteractive', '-File', script] : [script];
-  return spawnSync(surface.command, args, { cwd: root, env: item.env, encoding: 'utf8', timeout: 20_000 });
+  // Ceiling, not budget: single pwsh runs took over 20s on a loaded machine.
+  return spawnSync(surface.command, args, { cwd: root, env: item.env, encoding: 'utf8', timeout: 60_000 });
 }
 
+// pwsh writes its profile cache under HOME even for `exit 0`: probe in a throwaway one.
+const probeHome = mkdtempSync(join(tmpdir(), 'caveman hook probe '));
+test.after(() => rmSync(probeHome, { recursive: true, force: true }));
 for (const surface of surfaces) {
   const probe = spawnSync(surface.command, surface.extension === 'ps1'
-    ? ['-NoProfile', '-NonInteractive', '-Command', 'exit 0'] : ['--version'], { encoding: 'utf8' });
+    ? ['-NoProfile', '-NonInteractive', '-Command', 'exit 0'] : ['--version'], { encoding: 'utf8', env: { ...process.env, HOME: probeHome } });
   const options = { skip: probe.error?.code === 'ENOENT' ? `${surface.command} is not installed` : false };
 
   for (const [label, content, installOK] of [
@@ -79,6 +83,34 @@ for (const surface of surfaces) {
     assert.equal(existsSync(item.manifest), false);
     assert.equal(JSON.parse(readFileSync(item.settings, 'utf8')).theme, 'dark');
     assert.equal(JSON.parse(readFileSync(item.settings, 'utf8')).hooks, undefined);
+  });
+
+  test(`${surface.command}: uninstall keeps a settings.json.bak it did not make`, options, (t) => {
+    const item = fixture(t);
+    const hook = join(item.hooks, 'caveman-activate.js');
+    writeFileSync(hook, '');
+    const entry = { type: 'command', command: `node ${hook}` };
+    writeFileSync(item.settings, JSON.stringify({ model: 'opus', hooks: { SessionStart: [{ hooks: [entry] }] } }));
+    const mine = '{"model":"my-own-manual-backup"}\n';
+    writeFileSync(`${item.settings}.bak`, mine);
+    const removed = run(surface, item, 'uninstall');
+    assert.equal(removed.status, 0, removed.stdout + removed.stderr);
+    assert.equal(existsSync(hook), false);
+    assert.equal(readFileSync(`${item.settings}.bak`, 'utf8'), mine);
+  });
+
+  test(`${surface.command}: uninstall keeps the only copy of comments it dropped and removes a plain-JSON backup it made`, options, (t) => {
+    const item = fixture(t);
+    const entry = { type: 'command', command: `node ${join(item.hooks, 'caveman-activate.js')}` };
+    const body = JSON.stringify({ model: 'opus', hooks: { SessionStart: [{ hooks: [entry] }] } });
+    writeFileSync(item.settings, `// my model choice\n${body}\n`);
+    const jsonc = run(surface, item, 'uninstall');
+    assert.equal(jsonc.status, 0, jsonc.stdout + jsonc.stderr);
+    assert.match(readFileSync(`${item.settings}.bak`, 'utf8'), /my model choice/);
+    rmSync(`${item.settings}.bak`);
+    writeFileSync(item.settings, body);
+    assert.equal(run(surface, item, 'uninstall').status, 0);
+    assert.equal(existsSync(`${item.settings}.bak`), false);
   });
 
   test(`${surface.command}: malformed settings fail before overwriting existing hook bytes`, options, (t) => {

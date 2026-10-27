@@ -32,37 +32,40 @@ type StatsWindow struct {
 // money field means no eligible priced observation, including for empty stores.
 // SavedTokens is signed: request overhead must remain visible as a regression.
 type StatsMetrics struct {
-	Requests                  int64    `json:"requests"`
-	SuccessfulRequests        int64    `json:"successful_requests"`
-	FailedRequests            int64    `json:"failed_requests"`
-	CompleteUsageRequests     int64    `json:"complete_usage_requests"`
-	PartialUsageRequests      int64    `json:"partial_usage_requests"`
-	InputTokens               int64    `json:"input_tokens"`
-	OutputTokens              int64    `json:"output_tokens"`
-	CacheReadTokens           int64    `json:"cache_read_tokens"`
-	CacheWriteTokens          int64    `json:"cache_write_tokens"`
-	CacheWrite1hTokens        int64    `json:"cache_write_1h_tokens"`
-	ReasoningTokens           int64    `json:"reasoning_tokens"`
-	MeasuredRequests          int64    `json:"measured_requests"`
-	UnmeasuredRequests        int64    `json:"unmeasured_requests"`
-	BeforeTokens              int64    `json:"before_tokens"`
-	AfterTokens               int64    `json:"after_tokens"`
-	SavedTokens               int64    `json:"saved_tokens"`
-	ExpandedRequests          int64    `json:"expanded_requests"`
-	LegacyRequests            int64    `json:"legacy_requests"`
-	LegacySavedTokens         int64    `json:"legacy_saved_tokens"`
-	ObserveWouldSaveTokens    int64    `json:"observe_would_save_tokens"`
-	PricedRequests            int64    `json:"priced_requests"`
-	UnpricedRequests          int64    `json:"unpriced_requests"`
-	APISpendRequests          int64    `json:"api_spend_requests"`
-	APISavingsRequests        int64    `json:"api_savings_requests"`
-	EquivalentSpendRequests   int64    `json:"equivalent_spend_requests"`
-	EquivalentSavingsRequests int64    `json:"equivalent_savings_requests"`
-	UnknownAuthRequests       int64    `json:"unknown_auth_requests"`
-	APISpendUSD               *float64 `json:"api_spend_usd"`
-	APISavingsUSD             *float64 `json:"api_savings_usd"`
-	APIEquivalentSpendUSD     *float64 `json:"api_equivalent_spend_usd"`
-	APIEquivalentSavingsUSD   *float64 `json:"api_equivalent_savings_usd"`
+	Requests                  int64 `json:"requests"`
+	SuccessfulRequests        int64 `json:"successful_requests"`
+	FailedRequests            int64 `json:"failed_requests"`
+	CompleteUsageRequests     int64 `json:"complete_usage_requests"`
+	PartialUsageRequests      int64 `json:"partial_usage_requests"`
+	InputTokens               int64 `json:"input_tokens"`
+	OutputTokens              int64 `json:"output_tokens"`
+	CacheReadTokens           int64 `json:"cache_read_tokens"`
+	CacheWriteTokens          int64 `json:"cache_write_tokens"`
+	CacheWrite1hTokens        int64 `json:"cache_write_1h_tokens"`
+	ReasoningTokens           int64 `json:"reasoning_tokens"`
+	MeasuredRequests          int64 `json:"measured_requests"`
+	UnmeasuredRequests        int64 `json:"unmeasured_requests"`
+	BeforeTokens              int64 `json:"before_tokens"`
+	AfterTokens               int64 `json:"after_tokens"`
+	SavedTokens               int64 `json:"saved_tokens"`
+	ExpandedRequests          int64 `json:"expanded_requests"`
+	LegacyRequests            int64 `json:"legacy_requests"`
+	LegacySavedTokens         int64 `json:"legacy_saved_tokens"`
+	ObserveWouldSaveTokens    int64 `json:"observe_would_save_tokens"`
+	PricedRequests            int64 `json:"priced_requests"`
+	UnpricedRequests          int64 `json:"unpriced_requests"`
+	APISpendRequests          int64 `json:"api_spend_requests"`
+	APISavingsRequests        int64 `json:"api_savings_requests"`
+	EquivalentSpendRequests   int64 `json:"equivalent_spend_requests"`
+	EquivalentSavingsRequests int64 `json:"equivalent_savings_requests"`
+	UnknownAuthRequests       int64 `json:"unknown_auth_requests"`
+	// CacheWarmRequests counts the proxy's own prompt-cache warms. They are in
+	// no other count; their tokens and spend are in the totals.
+	CacheWarmRequests       int64    `json:"cache_warm_requests"`
+	APISpendUSD             *float64 `json:"api_spend_usd"`
+	APISavingsUSD           *float64 `json:"api_savings_usd"`
+	APIEquivalentSpendUSD   *float64 `json:"api_equivalent_spend_usd"`
+	APIEquivalentSavingsUSD *float64 `json:"api_equivalent_savings_usd"`
 }
 
 // StatsGroup is an additive cell. Joint dimensions let the dashboard filter
@@ -189,6 +192,14 @@ func sanitizeStatsMeasurement(rec *gateway.RequestRecord) {
 	}
 }
 
+// These three fragments must match the idx_requests_julianday_ts expression
+// index in store.go. If the text drifts, SQLite scans the table and sorts it.
+const (
+	statsWhereTo   = "julianday(ts) <= julianday(?)"
+	statsWhereFrom = "julianday(ts) >= julianday(?)"
+	statsOrderBy   = "ORDER BY julianday(ts) DESC, id DESC"
+)
+
 // BuildStatsReport reads the request ledger only. Transcript imports are not
 // unioned into this report: without an exact request join that would double count
 // routed traffic and attach savings to unrelated agent usage.
@@ -208,12 +219,12 @@ func (s *Store) BuildStatsReport(opts StatsReportOptions) (StatsReport, error) {
 	}
 	// Older ChatGPT rows used RFC3339 while the generic route used storeTSLayout.
 	// Compare instants, not their differing separators or timezone offsets.
-	where := []string{"julianday(ts) <= julianday(?)"}
+	where := []string{statsWhereTo}
 	args := []any{now.Format(time.RFC3339Nano)}
 	if opts.Days > 0 {
 		from := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC).AddDate(0, 0, 1-opts.Days)
 		out.Window.From = from.Format(time.RFC3339)
-		where = append(where, "julianday(ts) >= julianday(?)")
+		where = append(where, statsWhereFrom)
 		args = append(args, from.Format(time.RFC3339))
 	}
 	for _, filter := range []struct{ column, value string }{
@@ -235,8 +246,8 @@ func (s *Store) BuildStatsReport(opts StatsReportOptions) (StatsReport, error) {
 		request_estimated_input_delta_usd, COALESCE(request_savings_basis,''), COALESCE(pricing_known,0),
 		COALESCE(pricing_provider,''), COALESCE(pricing_model,''), COALESCE(pricing_catalog_version,''),
 		COALESCE(price_input_per_million,0), COALESCE(price_output_per_million,0), COALESCE(price_cache_read_per_million,0), COALESCE(price_cache_write_per_million,0), COALESCE(price_cache_write_1h_per_million,0), COALESCE(price_reasoning_per_million,0),
-		COALESCE(raw_request_sha256,''), COALESCE(transformed_request_sha256,'')
-		FROM requests WHERE `+strings.Join(where, " AND ")+` ORDER BY julianday(ts) DESC, id DESC`, args...)
+		COALESCE(raw_request_sha256,''), COALESCE(transformed_request_sha256,''), `+cacheWarmRow+`
+		FROM requests WHERE `+strings.Join(where, " AND ")+` `+statsOrderBy, args...)
 	if err != nil {
 		return out, err
 	}
@@ -250,11 +261,12 @@ func (s *Store) BuildStatsReport(opts StatsReportOptions) (StatsReport, error) {
 		var delta sql.NullFloat64
 		var known bool
 		var price StatsPrice
+		var warm bool
 		if err := rows.Scan(&r.ID, &r.Timestamp, &r.Provider, &r.Model, &r.Agent, &r.AuthMode, &r.StatusCode, &errorCode, &r.TokenUsageBasis,
 			&input, &output, &read, &write, &write1h, &reasoning, &legacyBefore, &legacyAfter, &observe,
 			&r.TokensBefore, &r.TokensAfter, &r.MeasurementBasis, &r.MeasurementStatus, &delta, &r.SavingsBasis, &known,
 			&price.Provider, &price.Model, &price.CatalogVersion, &price.InputPerMillion, &price.OutputPerMillion, &price.CacheReadPerMillion, &price.CacheWritePerMillion, &price.CacheWrite1hPerMillion, &price.ReasoningPerMillion,
-			&r.RawRequestSHA256, &r.TransformedRequestSHA256); err != nil {
+			&r.RawRequestSHA256, &r.TransformedRequestSHA256, &warm); err != nil {
 			return out, err
 		}
 		for _, layout := range []string{time.RFC3339Nano, storeTSLayout, time.DateTime} {
@@ -343,9 +355,18 @@ func (s *Store) BuildStatsReport(opts StatsReportOptions) (StatsReport, error) {
 				}
 			}
 		}
+		if warm {
+			// The proxy's own cache warm: its tokens and dollars are spend, but it
+			// is no agent request and never a receipt.
+			m = StatsMetrics{CacheWarmRequests: 1, InputTokens: m.InputTokens, OutputTokens: m.OutputTokens,
+				CacheReadTokens: m.CacheReadTokens, CacheWriteTokens: m.CacheWriteTokens, CacheWrite1hTokens: m.CacheWrite1hTokens,
+				ReasoningTokens: m.ReasoningTokens, APISpendUSD: m.APISpendUSD, APIEquivalentSpendUSD: m.APIEquivalentSpendUSD}
+		}
 		r.StatsMetrics = m
 		out.Totals.add(m)
-		out.Evidence.MeasurementStatuses[r.MeasurementStatus]++
+		if !warm {
+			out.Evidence.MeasurementStatuses[r.MeasurementStatus]++
+		}
 		day := r.Timestamp
 		if len(day) > 10 {
 			day = day[:10]
@@ -357,9 +378,11 @@ func (s *Store) BuildStatsReport(opts StatsReportOptions) (StatsReport, error) {
 			groups[key] = g
 		}
 		g.add(m)
-		if len(out.Receipts) < statsReceiptLimit {
+		switch {
+		case warm:
+		case len(out.Receipts) < statsReceiptLimit:
 			out.Receipts = append(out.Receipts, r)
-		} else {
+		default:
 			out.Evidence.ReceiptsTruncated = true
 		}
 		if opts.Days == 0 {
@@ -473,6 +496,7 @@ func (m *StatsMetrics) add(v StatsMetrics) {
 	m.EquivalentSpendRequests += v.EquivalentSpendRequests
 	m.EquivalentSavingsRequests += v.EquivalentSavingsRequests
 	m.UnknownAuthRequests += v.UnknownAuthRequests
+	m.CacheWarmRequests += v.CacheWarmRequests
 	addStatsMoney(&m.APISpendUSD, v.APISpendUSD)
 	addStatsMoney(&m.APISavingsUSD, v.APISavingsUSD)
 	addStatsMoney(&m.APIEquivalentSpendUSD, v.APIEquivalentSpendUSD)

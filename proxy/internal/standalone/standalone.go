@@ -33,6 +33,7 @@ import (
 	"github.com/JuliusBrussee/caveman/proxy/providers/vertex"
 	"github.com/JuliusBrussee/caveman/shared/platform/awscreds"
 	"github.com/JuliusBrussee/caveman/shared/platform/env"
+	"github.com/JuliusBrussee/caveman/shared/platform/redact"
 	"github.com/JuliusBrussee/caveman/shared/platform/ssrf"
 )
 
@@ -109,6 +110,20 @@ func tokenEqual(presented, token string) bool {
 	return subtle.ConstantTimeCompare([]byte(presented), []byte(token)) == 1
 }
 
+// inboundBearerEquals reports whether the request's Authorization header is a
+// Bearer carrying exactly this key. The comparison is constant-time: the value
+// is a secret and the outcome is observable in the forwarded headers.
+func inboundBearerEquals(r *http.Request, key string) bool {
+	if r == nil || key == "" {
+		return false
+	}
+	fields := strings.Fields(strings.TrimSpace(r.Header.Get("authorization")))
+	if len(fields) != 2 || !strings.EqualFold(fields[0], "Bearer") {
+		return false
+	}
+	return tokenEqual(fields[1], key)
+}
+
 // Creds preserves a real inbound provider credential first; otherwise it falls
 // back to the operator's BYOK env key. A key taken from an inbound
 // `Authorization: Bearer` keeps that scheme (Claude Pro/Max OAuth tokens only
@@ -183,6 +198,22 @@ func (c Creds) Resolve(provider string, r *http.Request) providers.Credential {
 		credential := providers.Credential{Mode: "ephemeral_header", Key: k, AuthFallbackEnv: fallbackEnv}
 		if provider == "bedrock" {
 			credential.AuthKind = "bedrock_api_key"
+		}
+		// One credential can arrive twice. A pi provider with `authHeader: true`
+		// sends its key as `Authorization: Bearer <key>` AND as `x-api-key:
+		// <key>`. x-api-key is resolved first so a shared listener cannot
+		// replace the caller's principal with its own, but an IDENTICAL bearer
+		// is that same principal, not a competing account. Dropping it left a
+		// bearer-only compat upstream with no credential it accepts: the named
+		// mount deletes authorization on an Anthropic-protocol path unless the
+		// credential declares the scheme, so such a gateway answered 401 and no
+		// configuration both routed and authenticated (#1215).
+		//
+		// Scoped to openai_compatible because that is the only provider whose
+		// upstream header this decides. anthropic and gemini read a bearer as
+		// OAuth pass-through, which a duplicated API key must not opt into.
+		if provider == "openai_compatible" && inboundBearerEquals(r, k) {
+			credential.Scheme = "bearer"
 		}
 		return credential
 	}
@@ -291,6 +322,17 @@ type Options struct {
 	// SessionFallback is conservative removed-marker correlation. It must return
 	// empty when more than one recent native session could own request.
 	SessionFallback func(time.Time, string, string) (string, string)
+	// Cloud is the signed-in Cloud link (route stage + runtime/v1 sender); it
+	// gates itself on the CLI's login and routing module. Nil: local only.
+	Cloud gateway.CloudLink
+	// AsyncRecord finishes telemetry rows off the request path (see
+	// gateway.Config.AsyncRecord); the caller closes the server before the sink.
+	AsyncRecord bool
+	// CacheWarm switches prompt-cache warming (the waste-fixes module plus the
+	// CAVEMAN_CACHE_WARM kill switch). Nil: warming off.
+	CacheWarm func() bool
+	// CacheWarmState is the warm table's learned-gap file. Empty: memory only.
+	CacheWarmState string
 }
 
 // New assembles a standalone gateway server from a config and a telemetry sink.
@@ -319,6 +361,10 @@ func New(cfg config.Config, sink gateway.TelemetrySink, opts Options) *gateway.S
 		HTTPClient:           client,
 		Logger:               opts.Logger,
 		MetricsToken:         cfg.MetricsToken,
+		Cloud:                opts.Cloud,
+		AsyncRecord:          opts.AsyncRecord,
+		CacheWarm:            opts.CacheWarm,
+		CacheWarmState:       opts.CacheWarmState,
 	})
 }
 
@@ -330,13 +376,49 @@ func New(cfg config.Config, sink gateway.TelemetrySink, opts Options) *gateway.S
 type engineCompressor struct {
 	eng   *engine.Engine
 	store *ccr.Store
+
+	// A failed compression is byte-safe but invisible: the gateway reads the
+	// (segment, 0, 0) below as "nothing to compress", so a recovery store that
+	// cannot be written stops compression with nothing in proxy.log and no
+	// off-state in `caveman status` (#1149). Report it instead of dropping it,
+	// throttled because a broken store fails on every block of every request.
+	logger   *slog.Logger
+	warnMu   sync.Mutex
+	warnedAt time.Time
+}
+
+// warnDropped reports an engine error the byte-safe pass-through would otherwise
+// hide. At most one warning per warnInterval, so a persistently broken store
+// leaves a trail without burying the rest of the log.
+const warnInterval = time.Minute
+
+func (c *engineCompressor) warnDropped(err error, mode string) {
+	if c.logger == nil || err == nil {
+		return
+	}
+	c.warnMu.Lock()
+	now := time.Now()
+	if !c.warnedAt.IsZero() && now.Sub(c.warnedAt) < warnInterval {
+		c.warnMu.Unlock()
+		return
+	}
+	c.warnedAt = now
+	c.warnMu.Unlock()
+	c.logger.Warn("compress failed; forwarding the block uncompressed",
+		"error", redact.Error(err), "path", mode)
 }
 
 // NewEngineCompressor builds the engine-backed compressor over a CCR store. The
 // engine shares that store, so a handle returned by StoreOriginal resolves through
 // engine.Retrieve to the exact original bytes supplied by the gateway.
 func NewEngineCompressor(store *ccr.Store) gateway.Compressor {
-	return &engineCompressor{eng: engine.New(store, nil), store: store}
+	return NewEngineCompressorWithLogger(store, nil)
+}
+
+// NewEngineCompressorWithLogger is NewEngineCompressor with somewhere to report
+// a failed compression. A nil logger is legal and silences the reporting.
+func NewEngineCompressorWithLogger(store *ccr.Store, logger *slog.Logger) gateway.Compressor {
+	return &engineCompressor{eng: engine.New(store, nil), store: store, logger: logger}
 }
 
 // NewEstimateCompressor builds the observe-only compressor for record-mode
@@ -352,6 +434,7 @@ func NewEstimateCompressor() gateway.Compressor {
 func (c *engineCompressor) CompressSegment(segment []byte) ([]byte, int, int) {
 	res, err := c.eng.Compress(segment, engine.Options{Mode: engine.ModeCompress})
 	if err != nil {
+		c.warnDropped(err, "segment")
 		return segment, 0, 0 // byte-safe: keep the original segment, claim no delta.
 	}
 	return res.Output, res.TokensBefore, res.TokensAfter
@@ -360,6 +443,7 @@ func (c *engineCompressor) CompressSegment(segment []byte) ([]byte, int, int) {
 func (c *engineCompressor) CompressSegmentType(segment []byte, contentType string) ([]byte, int, int) {
 	res, err := c.eng.Compress(segment, engine.Options{Mode: engine.ModeCompress, Type: contentType})
 	if err != nil {
+		c.warnDropped(err, "segment-type")
 		return segment, 0, 0
 	}
 	return res.Output, res.TokensBefore, res.TokensAfter
@@ -371,6 +455,7 @@ func (c *engineCompressor) CompressSegmentType(segment []byte, contentType strin
 func (c *engineCompressor) CompressSegmentQuery(segment []byte, query string) ([]byte, int, int) {
 	res, err := c.eng.Compress(segment, engine.Options{Mode: engine.ModeCompress, Query: query})
 	if err != nil {
+		c.warnDropped(err, "segment-query")
 		return segment, 0, 0
 	}
 	return res.Output, res.TokensBefore, res.TokensAfter
@@ -430,9 +515,10 @@ func (c *engineCompressor) RetrieveOriginal(handle, query string) ([]byte, error
 // a configuration file that may have changed after this listener started.
 func ProviderUpstreams(cfg config.Config) map[string]string {
 	return map[string]string{
-		"anthropic": cfg.BaseURL("anthropic", "https://api.anthropic.com"),
-		"openai":    cfg.BaseURL("openai", "https://api.openai.com"),
-		"gemini":    cfg.BaseURL("gemini", "https://generativelanguage.googleapis.com"),
+		"anthropic":    cfg.BaseURL("anthropic", "https://api.anthropic.com"),
+		"openai":       cfg.BaseURL("openai", "https://api.openai.com"),
+		"gemini":       cfg.BaseURL("gemini", "https://generativelanguage.googleapis.com"),
+		"openai-codex": strings.TrimSuffix(gateway.DefaultChatGPTUpstream, "/codex"),
 	}
 }
 

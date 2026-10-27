@@ -969,3 +969,172 @@ func TestTrimmedSummaryDeclaresWhatItShed(t *testing.T) {
 		}
 	}
 }
+
+// A non-finite value parses cleanly through strconv.ParseFloat and then
+// compares false against every bound, so it used to sit on the numeric track
+// without ever joining the range it was being described by. The marker then
+// stated `name=min..max` over a run holding a unit that satisfies no bound at
+// all. Such a field must leave the numeric track instead and be reported by a
+// form that counts every unit.
+func TestNonFiniteValuesLeaveTheNumericTrack(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		values   []string
+		wantSeen string
+	}{
+		{"NaN mid-run", []string{"100", "250", "NaN", "400"}, "NaN"},
+		{"NaN last", []string{"100", "250", "400", "nan"}, "nan"},
+		{"infinity mid-run", []string{"100", "250", "Infinity", "400"}, "Infinity"},
+		{"negative inf", []string{"100", "-Inf", "400"}, "-Inf"},
+		{"NaN in an enumerable run", []string{"100", "100", "250", "NaN"}, "NaN×1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			units := make([][]field, len(tc.values))
+			for i, v := range tc.values {
+				units[i] = fields("state", "ok", "amount", v)
+			}
+			got := summarizeElided(units, 1<<20)
+			if strings.Contains(got, "range amount=") {
+				t.Fatalf("a run holding %q was described by a numeric range: %q", tc.values, got)
+			}
+			// Whatever form it falls back to, the non-finite unit must be
+			// visible in it rather than absorbed into a bound it never met.
+			if !strings.Contains(got, tc.wantSeen) {
+				t.Fatalf("summary %q hides the non-finite unit %q", got, tc.wantSeen)
+			}
+		})
+	}
+
+	// A run whose values are ALL non-finite is still genuinely constant, and
+	// that fact is verified — it must still be stated.
+	allNaN := [][]field{fields("amount", "NaN"), fields("amount", "NaN"), fields("amount", "NaN")}
+	if got := summarizeElided(allNaN, 1<<20); got != "all amount=NaN" {
+		t.Fatalf("a constant NaN run should still be reported as constant, got %q", got)
+	}
+
+	// Finite numbers are untouched: the range is still the whole point.
+	finite := [][]field{fields("amount", "100"), fields("amount", "250"), fields("amount", "400")}
+	if got := summarizeElided(finite, 1<<20); got != "range amount=100..400" {
+		t.Fatalf("finite numbers must still render a range, got %q", got)
+	}
+}
+
+// keepNumericExtrema latches minIndex/maxIndex on the first numeric cell it
+// sees and then only displaces them on a strict comparison. A NaN compares
+// false against everything, so the first one seen pinned both ends and the
+// column's real extrema stopped being kept — the exact rows this function
+// exists to hold back from elision.
+func TestKeepNumericExtremaIgnoresNonFinite(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		values []string
+	}{
+		{"NaN first", []string{"NaN", "10", "70", "30"}},
+		{"inf first", []string{"Inf", "10", "70", "30"}},
+		{"NaN mid", []string{"50", "NaN", "70", "10"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rows := [][]string{{"amount"}}
+			for _, v := range tc.values {
+				rows = append(rows, []string{v})
+			}
+			keep := make([]bool, len(rows))
+			keepNumericExtrema(rows, 1, keep)
+
+			var kept []string
+			for i := 1; i < len(rows); i++ {
+				if keep[i] {
+					kept = append(kept, rows[i][0])
+				}
+			}
+			for _, want := range []string{"10", "70"} {
+				found := false
+				for _, k := range kept {
+					if k == want {
+						found = true
+					}
+				}
+				if !found {
+					t.Fatalf("real extremum %q was not kept from %v, kept %v", want, tc.values, kept)
+				}
+			}
+		})
+	}
+}
+
+// A float64 may carry a field's min/max only if it can ORDER two literals
+// written to that field's precision. Past 2^53 that fails for integers
+// (snowflake IDs, nanosecond timestamps), and it fails well below 2^53 once a
+// literal carries enough fraction digits: "123456789012345.26" and
+// "...345.27" are 0.01 apart where the float64 grid near 1.2e14 steps by
+// 0.03125, so min/max stops being a total order and the marker states a bound
+// an elided row exceeds. Ordinary money and measurement columns must stay on
+// the numeric track regardless.
+func TestInvariantNumberRefusesUnorderableLiterals(t *testing.T) {
+	for _, tc := range []struct {
+		value   string
+		numeric bool
+		why     string
+	}{
+		// Kept: the float64 grid is far finer than the written digit.
+		{"0", true, "zero"},
+		{"5.00", true, "money, two fraction digits"},
+		{"199.99", true, "money, two fraction digits"},
+		{"-199.99", true, "negative money"},
+		{"1234567", true, "plain integer"},
+		{"9007199254740991", true, "2^53-1, the largest exactly-held integer"},
+		{"1.5e3", true, "exponent notation, granularity 100"},
+		{"1e20", true, "one significant digit at 1e20, granularity 1e20"},
+		{"1e+20", true, "a signed exponent parses the same way"},
+		{"1E-5", true, "upper-case negative exponent"},
+		{"1e308", true, "near the float64 maximum"},
+		{"1e-320", true, "subnormal, where the grid is still finer than the digit"},
+		{"0.000001", true, "small magnitude, fine granularity"},
+
+		// Refused: two adjacent literals at this precision can collide.
+		{"9007199254740992", false, "2^53, where the integer grid starts stepping by 2"},
+		{"1234567890123456000", false, "snowflake-scale integer"},
+		{"1760000000000000000", false, "nanosecond timestamp"},
+		{"123456789012345.27", false, "0.01 step against a 0.03125 ULP"},
+		{"-123456789012345.27", false, "same, negative"},
+
+		// Refused: granularity is not readable off the literal.
+		{"0x1p60", false, "hex float"},
+		{"0X1P60", false, "hex float, upper case"},
+		{"1_000", false, "underscore digit groups: granularity unreadable"},
+		{"1e", false, "malformed exponent"},
+		{" 12", false, "ParseFloat refuses a leading space"},
+		{"NaN", false, "not finite"},
+		{"Inf", false, "not finite"},
+		{"1e400", false, "overflows to Inf"},
+		{"", false, "not a number"},
+		{"abc", false, "not a number"},
+	} {
+		_, ok := invariantNumber(tc.value)
+		if ok != tc.numeric {
+			t.Errorf("invariantNumber(%q) = %v, want %v (%s)", tc.value, ok, tc.numeric, tc.why)
+		}
+	}
+}
+
+// The guard has to hold the line end to end, not just in isolation: a column of
+// high-precision decimals must leave the numeric track entirely rather than
+// reach a marker as `name=min..max`.
+func TestInvariantHighPrecisionDecimalStatesNoNumericRange(t *testing.T) {
+	units := make([][]field, 0, 24)
+	for i := 0; i < 24; i++ {
+		units = append(units, []field{{name: "amount", value: fmt.Sprintf("123456789012345.%d", i+10)}})
+	}
+	if got := summarizeElided(units, 4096); strings.Contains(got, "range amount=") {
+		t.Fatalf("high-precision decimals reached the numeric range track: %q", got)
+	}
+
+	// Same shape at a precision float64 orders cleanly still gets its range.
+	money := make([][]field, 0, 24)
+	for i := 0; i < 24; i++ {
+		money = append(money, []field{{name: "amount", value: fmt.Sprintf("%d.%02d", 100+i, i)}})
+	}
+	if got := summarizeElided(money, 4096); !strings.Contains(got, "range amount=") {
+		t.Fatalf("an ordinary money column lost its numeric range: %q", got)
+	}
+}

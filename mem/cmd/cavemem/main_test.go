@@ -249,7 +249,7 @@ func TestRememberStdinTooLargeSubprocessExits65(t *testing.T) {
 // one shared mem.db file — the real shape of Promise.all(facts.map(remember))
 // from the JS client, which each spawn a fresh binary. On the pre-fix store the
 // contending processes returned SQLITE_BUSY and dropped most writes; the
-// busy_timeout(5000)+WAL DSN makes them wait so every write lands.
+// busy_timeout(5000)+WAL plus the bounded busy retry makes every write land.
 func TestConcurrentRememberSubprocesses(t *testing.T) {
 	if testing.Short() {
 		t.Skip("builds and execs the cavemem binary; skipped under -short")
@@ -311,4 +311,30 @@ func (e *subprocErr) Error() string {
 
 func fmtFact(i int) string {
 	return "subprocess memory number " + strconv.Itoa(i) + " about distinct topic " + strconv.Itoa(i)
+}
+
+func TestSupersedeReadsReplacementFromStdinAndMapsTooLargeExit(t *testing.T) {
+	store, err := mem.Open(mem.Options{InMemory: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	old, err := store.Remember("deploy key is in vault")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out, errOut bytes.Buffer
+	if code := handleArgs(store, []string{"supersede", old.ID, "--stdin"}, strings.NewReader("deploy key moved"), &out, &errOut); code != 0 {
+		t.Fatalf("supersede --stdin exit %d: %s", code, errOut.String())
+	}
+	current, err := store.Remember("deploy key moved")
+	if err != nil || current.ID == "" {
+		t.Fatalf("replacement was not stored: %v", err)
+	}
+	out.Reset()
+	errOut.Reset()
+	huge := strings.NewReader(strings.Repeat("x", mem.MaxMemoryBytes+1))
+	if code := handleArgs(store, []string{"supersede", current.ID, "--stdin"}, huge, &out, &errOut); code != memoryTooLargeExitCode {
+		t.Fatalf("oversized supersede exit %d, want %d", code, memoryTooLargeExitCode)
+	}
 }

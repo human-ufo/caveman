@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { trimTrailingSlashes, verifiedProviderRoute, publishedUpstreamsOf, unforwardedProviderHeaders, publishedForwardHeadersOf } from '../dist/provider-routing.js';
+import { trimTrailingSlashes, verifiedChatGPTSubscriptionRoute, verifiedProviderRoute, publishedUpstreamsOf, unforwardedProviderHeaders, publishedForwardHeadersOf } from '../dist/provider-routing.js';
 const gw = 'http://127.0.0.1:8787/w/host';
 const native = { openai: 'https://api.openai.com', anthropic: 'https://api.anthropic.com', gemini: 'https://generativelanguage.googleapis.com' };
 test('provider-specific header forwarding requires a contract for the exact mount', () => {
@@ -14,6 +14,16 @@ test('provider-specific header forwarding requires a contract for the exact moun
   assert.deepEqual(unforwardedProviderHeaders('openai-completions', 'relay', { ...headers, 'X-Unrelated': 'secret' }, published), ['X-Unrelated']);
   assert.deepEqual(unforwardedProviderHeaders('openai-responses', 'relay', { Authorization: 'Bearer key', 'X-Optional': undefined }), []);
 });
+test('ChatGPT subscription route requires the exact published Codex upstream', () => {
+  const published = { provider_upstreams: { ...native, 'openai-codex': 'https://chatgpt.com/backend-api' } };
+  assert.equal(verifiedChatGPTSubscriptionRoute(gw, 'openai-codex-responses', 'openai-codex', 'https://chatgpt.com/backend-api', published), gw);
+  assert.equal(verifiedChatGPTSubscriptionRoute(gw, 'openai-codex-responses', 'openai-codex', 'https://chatgpt.com/backend-api/', published), gw);
+  assert.equal(verifiedChatGPTSubscriptionRoute(gw, 'openai-codex-responses', 'openai-codex', 'https://chatgpt.com/backend-api', { provider_upstreams: native }), undefined);
+  assert.equal(verifiedChatGPTSubscriptionRoute(gw, 'openai-codex-responses', 'openai-codex', 'https://chatgpt.com/backend-api/codex', published), undefined);
+  assert.equal(verifiedChatGPTSubscriptionRoute(gw, 'openai-responses', 'openai-codex', 'https://chatgpt.com/backend-api', published), undefined);
+  assert.equal(verifiedChatGPTSubscriptionRoute(gw, 'openai-codex-responses', 'other', 'https://chatgpt.com/backend-api', published), undefined);
+});
+
 for (const [api, base, route] of [
   ['openai-completions', 'https://api.openai.com/v1', '/openai/v1'],
   ['openai-responses', 'https://api.openai.com/v1/', '/openai/v1'],
@@ -34,6 +44,18 @@ for (const [base, original] of [
   ['https://relay.example/tenant/v1', 'https://relay.example/tenant/v1'],
 ]) test(`compat overlap follows Go path join for ${base}`, () => {
   assert.equal(verifiedProviderRoute(gw, 'openai-responses', 'relay', original, { compat_upstreams: { relay: base } }), gw + '/compat/relay/v1');
+});
+// #1324: Pi's built-in DeepSeek and Z.ai bases carry no /v1. The mount forwards
+// the unversioned path as sent, so a mount on that same base verifies; a mount
+// that would put /v1 back on the way out still does not.
+for (const [provider, base] of [
+  ['deepseek', 'https://api.deepseek.com'],
+  ['zai', 'https://api.z.ai/api/coding/paas/v4'],
+]) test(`compat routes an OpenAI base without /v1: ${base}`, () => {
+  for (const api of ['openai-completions', 'openai-responses']) {
+    assert.equal(verifiedProviderRoute(gw, api, provider, base, { compat_upstreams: { [provider]: base } }), gw + `/compat/${provider}`);
+  }
+  assert.equal(verifiedProviderRoute(gw, 'openai-completions', provider, base, { compat_upstreams: { [provider]: base + '/v1' } }), undefined);
 });
 test('internal double slashes do not collapse into another tenant endpoint', () => {
   assert.equal(verifiedProviderRoute(gw, 'openai-responses', 'relay', 'https://relay.example/tenant/sub/v1', { compat_upstreams: { relay: 'https://relay.example/tenant//sub' } }), undefined);

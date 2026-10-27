@@ -58,6 +58,25 @@ func jsonAPIPage(records int) []byte {
 	return []byte(b.String())
 }
 
+// pytestReport is a pytest-json-report page: valid JSON that Detect routes to
+// test-report, whose compressor keeps every failure and the summary counts.
+func pytestReport(tests int) []byte {
+	var b strings.Builder
+	b.WriteString(`{"exitcode":1,"duration":4.2,"tests":[`)
+	for i := 0; i < tests; i++ {
+		if i > 0 {
+			b.WriteString(",")
+		}
+		outcome := "passed"
+		if i%9 == 0 {
+			outcome = "failed"
+		}
+		fmt.Fprintf(&b, `{"nodeid":"tests/test_inventory.py::test_sku_%05d","outcome":"%s"}`, 60000+i, outcome)
+	}
+	b.WriteString(`]}`)
+	return []byte(b.String())
+}
+
 func csvExport(rows int) []byte {
 	var b strings.Builder
 	b.WriteString("sku,on_hand,reserved,supplier,line_status\n")
@@ -98,6 +117,7 @@ func TestStructuredToolOutputIsNotMasked(t *testing.T) {
 		{"json api page", jsonAPIPage(60), engine.TypeJSON},
 		{"csv export", csvExport(120), engine.TypeTabular},
 		{"ndjson event stream", ndjsonEvents(120), engine.TypeLog},
+		{"pytest json report", pytestReport(60), engine.TypeTestReport},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := engine.New(nil, nil).Detect(tc.output); got != tc.wantsAs {
@@ -144,6 +164,26 @@ func TestMaskThresholdUnchangedForMaskableClasses(t *testing.T) {
 	}
 	if masked, _ := maskDecision(t, runtime, prosebBlob(4096)); !masked {
 		t.Error("a prose output well over the threshold must be masked")
+	}
+}
+
+// TestShortToolOutputIsNotMasked (#1365): a stub that carries no content costs
+// the agent a full extra model request to redeem, which is more than writing a
+// few KB into context once. Below minMaskBytes the output passes through, but is
+// still captured so the handle stays valid.
+func TestShortToolOutputIsNotMasked(t *testing.T) {
+	runtime := maskRuntime(t)
+	for _, size := range []int{1800, minMaskBytes - 200} {
+		masked, response := maskDecision(t, runtime, prosebBlob(size))
+		if masked {
+			t.Errorf("a ~%d-byte output must pass through unchanged", size)
+		}
+		if response.RecoveryRef == "" {
+			t.Errorf("a ~%d-byte output must still be captured for recovery", size)
+		}
+	}
+	if masked, _ := maskDecision(t, runtime, prosebBlob(minMaskBytes+200)); !masked {
+		t.Error("an output past minMaskBytes must still be masked")
 	}
 }
 

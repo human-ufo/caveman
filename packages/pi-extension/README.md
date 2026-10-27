@@ -26,14 +26,23 @@ One extension, four jobs:
   private active telemetry preference.
 
 - **Exact recovery** — registers a single model-visible tool, `caveman_retrieve`,
-  backed by the local `caveman-mcp` binary and the shared CCR store. Compressed
-  bytes are always recoverable, byte-exact.
+  backed by the local `caveman-mcp` binary and the shared CCR store. Before
+  shortening a tool result, the extension checks that its advertised handle
+  resolves to the original bytes without consuming the model's later recovery.
+  Missing, mismatched, or unverifiable handles leave the original output intact.
+  Older companions without verification support keep tool results unchanged. A
+  session that cannot call `caveman_retrieve` leaves results unchanged as well —
+  `pi --tools …` without it, or a subagent with its own `tools:` list, replaces
+  the active tool set, and a handle the model cannot redeem would lose the
+  output instead of compressing it.
 - **Native lifecycle** — bridges Pi session/turn/tool events into the Caveman
   native runtime (Core injection, per-turn context, tool-output shrinking).
 - **Honest fallback** — routing activates only after the recovery gate holds
   (proxy alive, recovery contract matched, MCP child initialized). Anything else
   is a visible pass-through: direct provider, one notice, no savings claims.
-  OAuth/subscription-authenticated models are never routed.
+  OAuth/subscription models stay direct unless the running proxy explicitly
+  advertises a verified subscription route. Pi's built-in `openai-codex`
+  ChatGPT Responses provider is supported; other OAuth providers remain direct.
 
 ## Install
 
@@ -44,7 +53,8 @@ caveman wrap pi      # this session only
 caveman enable pi    # persistent; plain `pi` stays routed until `caveman disable pi`
 ```
 
-Or as a plain Pi package:
+Or as a plain Pi package. Use this or `caveman enable pi`, not both: Pi refuses
+to start when two copies register the same tool.
 
 ```bash
 pi install npm:@caveman-ai/pi
@@ -54,4 +64,4 @@ Requires the Caveman CLI (`npm i -g @caveman-ai/cli`) plus the local
 `caveman-proxy` / `caveman-mcp` binaries (`caveman setup`). Without them the
 extension loads, says so once, and stays out of the way.
 
-Pinned against `@earendil-works/pi-coding-agent` 0.84.2.
+Pinned against `@earendil-works/pi-coding-agent` 1.0.4.
