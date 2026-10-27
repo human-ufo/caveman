@@ -5,6 +5,8 @@ import (
 	"encoding/csv"
 	"fmt"
 	"io"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -170,5 +172,86 @@ func TestTabularCSVPreservesCRLFWithoutAddingTrailingNewline(t *testing.T) {
 	}
 	if bytes.Contains(bytes.ReplaceAll(out, []byte("\r\n"), nil), []byte("\n")) {
 		t.Fatal("compressed CSV mixed newline styles")
+	}
+}
+
+// A CSV export with one non-numeric measurement — how pandas, Postgres
+// `numeric` and R all spell a missing value — must not compress to something
+// indistinguishable from a table where that value was a clean number.
+//
+// "NaN" parses through strconv.ParseFloat, so the amount column stayed on the
+// numeric track, and NaN compares false against every bound, so the row joined
+// no range. It was elided into a run the marker then described as
+// `range amount=lo..hi`, and the compressed view came out byte-identical to the
+// same table with a real number in that cell: the fact that one row had no
+// amount at all was gone, under a contract line telling the agent to answer
+// from this view.
+func TestTabularNonFiniteCellIsNotAbsorbedIntoARange(t *testing.T) {
+	ledger := func(row10 string) []byte {
+		var b strings.Builder
+		b.WriteString("region,status,note,amount\n")
+		for i := 0; i < 80; i++ {
+			amount := fmt.Sprintf("%d", 110+i%60)
+			if i == 10 {
+				amount = row10
+			}
+			fmt.Fprintf(&b, "eu,ok,settled invoice for the quarterly subscription renewal,%s\n", amount)
+		}
+		return []byte(b.String())
+	}
+
+	withNaN, ok := compressors.NewTabular().Compress(ledger("NaN"))
+	if !ok {
+		t.Fatal("expected CSV compression")
+	}
+	clean, ok := compressors.NewTabular().Compress(ledger("120"))
+	if !ok {
+		t.Fatal("expected CSV compression")
+	}
+
+	if bytes.Equal(withNaN, clean) {
+		t.Fatalf("a row with no amount compressed to the same bytes as one with amount=120:\n%s", withNaN)
+	}
+	if !bytes.Contains(withNaN, []byte("NaN")) {
+		t.Fatalf("the NaN row left no trace in the compressed view:\n%s", withNaN)
+	}
+}
+
+// Past 2^53 two different integers can parse to the same float64 (snowflake
+// IDs, nanosecond timestamps). The id column stayed on the numeric track, the
+// compare could not tell ...8500 from ...8600, and the marker stated a maximum
+// that an elided row exceeds. Whatever bounds the marker states for the column
+// must cover every elided row.
+func TestTabularLargeIntegerRangeCoversEveryElidedRow(t *testing.T) {
+	const first, step, rows = 1234567890123456000, 100, 30
+	var b strings.Builder
+	b.WriteString("id,status\n")
+	for i := 0; i < rows; i++ {
+		fmt.Fprintf(&b, "%d,ok\n", first+i*step)
+	}
+	out, ok := compressors.NewTabular().Compress([]byte(b.String()))
+	if !ok {
+		t.Fatal("expected CSV compression")
+	}
+	marker := regexp.MustCompile(`id[=: ][^.]*?(\d{19})\.\.(\d{19})`).FindSubmatch(out)
+	if marker == nil {
+		return // no stated range, nothing to get wrong
+	}
+	lo, _ := strconv.ParseInt(string(marker[1]), 10, 64)
+	hi, _ := strconv.ParseInt(string(marker[2]), 10, 64)
+	kept := map[int64]bool{}
+	for _, line := range strings.Split(string(out), "\n") {
+		if id, err := strconv.ParseInt(strings.SplitN(line, ",", 2)[0], 10, 64); err == nil {
+			kept[id] = true
+		}
+	}
+	for i := 0; i < rows; i++ {
+		id := int64(first + i*step)
+		if kept[id] {
+			continue
+		}
+		if id < lo || id > hi {
+			t.Fatalf("elided id %d is outside the stated range %d..%d:\n%s", id, lo, hi, out)
+		}
 	}
 }

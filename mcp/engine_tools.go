@@ -1,12 +1,16 @@
 package mcp
 
 import (
+	"crypto/sha256"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
 
 	"github.com/JuliusBrussee/caveman/engine"
+	"github.com/JuliusBrussee/caveman/engine/ccr"
 )
 
 // Engine is the slice of the Caveman Engine the Caveman tools need.
@@ -54,6 +58,7 @@ func EngineTools(eng Engine, log *slog.Logger) []Tool {
 			InputSchema: ObjectSchema(map[string]any{
 				"recovery_handle": StringProp("Exact ccr_ handle returned by Caveman or copied from a <<ccr:HANDLE>> marker."),
 				"query":           StringProp("Optional broad query covering related details. Omit for the byte-exact full original."),
+				"verify_only":     map[string]any{"type": "boolean", "description": "Check exact-original availability and return its byte length and SHA-256 without consuming a recovery delivery. Ignores query."},
 			}, "recovery_handle"),
 			// Recovery returns the exact original bytes: exempt from the
 			// result-size cap so a >cap original (the shared gateway store has no
@@ -166,6 +171,7 @@ func retrieveTool(eng Engine, args json.RawMessage) ToolResult {
 	var a struct {
 		RecoveryHandle string `json:"recovery_handle"`
 		Query          string `json:"query"`
+		VerifyOnly     bool   `json:"verify_only"`
 	}
 	if err := json.Unmarshal(args, &a); err != nil || a.RecoveryHandle == "" {
 		return ToolError("cave_invalid_arguments", "retrieve: missing recovery_handle")
@@ -174,13 +180,33 @@ func retrieveTool(eng Engine, args json.RawMessage) ToolResult {
 	if a.RecoveryHandle == "" {
 		return ToolError("cave_invalid_arguments", "retrieve: missing recovery_handle")
 	}
+	if a.VerifyOnly {
+		original, err := eng.Retrieve(a.RecoveryHandle)
+		if err != nil {
+			return retrieveError(err)
+		}
+		return ToolText(map[string]any{
+			"recovery_handle": a.RecoveryHandle,
+			"byte_length":     len(original),
+			"sha256":          fmt.Sprintf("%x", sha256.Sum256(original)),
+		})
+	}
 	// A query narrows recovery to the relevant sections (BM25); empty query is
 	// byte-exact full recovery. RetrieveQuery never drops detail it cannot rank.
 	original, err := eng.RetrieveQuery(a.RecoveryHandle, a.Query)
 	if err != nil {
-		return ToolError("cave_unknown_handle", "no original found for handle")
+		return retrieveError(err)
 	}
 	return ToolRawText(string(original))
+}
+
+// retrieveError maps a retrieval failure to its tool error. Damaged stored data
+// must not read as an unknown handle, because the agent would retry in vain.
+func retrieveError(err error) ToolResult {
+	if errors.Is(err, ccr.ErrCorruptRecovery) {
+		return ToolError("cave_corrupt_recovery", "stored data for this handle is damaged. Run PRAGMA quick_check on ~/.caveman/ccr.db")
+	}
+	return ToolError("cave_unknown_handle", "no original found for handle")
 }
 
 // normalizeRecoveryHandle accepts every form of a recovery reference this stack

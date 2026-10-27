@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/JuliusBrussee/caveman/engine"
@@ -103,18 +104,22 @@ type Runtime struct {
 	receiptDir            string
 	usage                 sessionusage.Reader
 	mu                    sync.Mutex // activeSessions and lastActivity only
-	sessionLocks          [64]sync.Mutex
+	sessionStripes        [64]chan struct{}
 	repositoryMu          sync.RWMutex
 	repositoryMaps        map[string]*repositoryMapEntry
-	repositorySessionRefs map[string]string
+	repositorySessionRefs map[string]repositorySessionRef
 	repositoryWarming     map[string]bool
-	repositoryEnded       map[string]bool
+	repositoryEnded       map[string]time.Time
 	activeSessions        map[string]sessionActivity
 	lastActivity          time.Time
 	// detect classifies a tool output so afterTool can tell what the elision
 	// engine could do with it. Deterministic, local, no store and no network. A
 	// nil detect means "cannot classify", which masks — see maskWouldDiscardFacts.
 	detect func([]byte) string
+	// OnTurnStart, when set, runs on every session.start and prompt.submit,
+	// before the model request they announce (the Cloud link warms its route
+	// path). It must not block.
+	OnTurnStart func()
 }
 
 type sessionActivity struct {
@@ -124,20 +129,38 @@ type sessionActivity struct {
 	Model    string
 }
 
+// repositorySessionRef is the stored repository-map object for one session,
+// with the last time that session created or read it. The timestamp is what
+// lets pruneRepositoryState reclaim a session whose host disappeared without
+// ever sending session.end, which repositoryEnded alone cannot see.
+type repositorySessionRef struct {
+	id string
+	at time.Time
+}
+
 type repositoryMapEntry struct {
 	done    chan struct{}
 	repoMap repointel.Map
 	err     error
+	// lastAccess is unix nanoseconds of the last time a session created or
+	// read this entry. pruneRepositoryState reclaims entries idle past
+	// repositoryPruneWindow. Atomic because repositoryEvidenceContext and
+	// captureTestImpact only hold repositoryMu.RLock when they touch it.
+	lastAccess atomic.Int64
 }
 
 func newRuntime(store *ccr.Store) *Runtime {
-	return &Runtime{
+	runtime := &Runtime{
 		store: store, repositoryMaps: map[string]*repositoryMapEntry{},
-		repositorySessionRefs: map[string]string{}, repositoryWarming: map[string]bool{}, repositoryEnded: map[string]bool{},
+		repositorySessionRefs: map[string]repositorySessionRef{}, repositoryWarming: map[string]bool{}, repositoryEnded: map[string]time.Time{},
 		activeSessions: map[string]sessionActivity{}, lastActivity: time.Now(),
 		// A store-less engine: Detect reads only the bytes handed to it.
 		detect: engine.New(nil, nil).Detect,
 	}
+	for i := range runtime.sessionStripes {
+		runtime.sessionStripes[i] = make(chan struct{}, 1)
+	}
+	return runtime
 }
 
 func New(store *ccr.Store) *Runtime { return newRuntime(store) }
@@ -202,12 +225,84 @@ func resolveProfile(raw, policyMode string) (string, profileFeatures, error) {
 	}
 }
 
-func (r *Runtime) Handle(_ context.Context, request Request) (Response, error) {
-	started := time.Now()
-	sessionLock := r.sessionLock(request.Session.ID)
-	sessionLock.Lock()
-	defer sessionLock.Unlock()
+// decisionResult carries one settled decision from the drain goroutine back to
+// Handle.
+type decisionResult struct {
+	response Response
+	err      error
+}
 
+// Handle decides one packed host event. The context is the hook deadline and it
+// is honored: the thin host adapter across the socket gives up at the same
+// deadline, so a store call wedged on cross-process database contention must
+// not run Handle to the store's own 5s busy timeout. It used to (issue #1279:
+// an upgraded home whose ccr.db was write-locked by stale 2.x processes closed
+// every native.sock connection with an empty reply seconds after the hook had
+// already failed open, and every queued event behind it did the same).
+func (r *Runtime) Handle(ctx context.Context, request Request) (Response, error) {
+	mustRun := stateOnlyEvents[request.Event.Type]
+	if err := ctx.Err(); err != nil && !mustRun {
+		return Response{}, fmt.Errorf("native runtime: hook budget exhausted before %s: %w", request.Event.Type, err)
+	}
+	// The decision runs on its own goroutine so the deadline bounds it from the
+	// outside: when the budget dies, Handle returns fail-open immediately and
+	// the drain finishes the store work in the background. The drain queues
+	// for the session stripe itself, and a channel serves its waiters in
+	// arrival order, so a later session.end cannot overtake an event queued
+	// before it. A waiter whose budget dies leaves the queue (and frees its
+	// payload) at its deadline; the state-only events stay queued and run.
+	stripe := r.sessionStripe(request.Session.ID)
+	out := make(chan decisionResult, 1)
+	go func() {
+		if mustRun {
+			stripe <- struct{}{}
+		} else {
+			select {
+			case stripe <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
+		}
+		defer func() { <-stripe }()
+		response, err := r.respond(ctx, request)
+		out <- decisionResult{response: response, err: err}
+	}()
+	select {
+	case result := <-out:
+		return result.response, result.err
+	case <-ctx.Done():
+		select {
+		case result := <-out:
+			return result.response, result.err
+		default:
+		}
+		return Response{}, fmt.Errorf("native runtime: hook budget exhausted during %s: %w", request.Event.Type, ctx.Err())
+	}
+}
+
+// stateOnlyEvents send the host nothing it acts on; their whole effect is the
+// store write (archive and receipt, compaction transition, subagent state and
+// evidence merge). They run to completion on the drain even after the hook
+// deadline, because the host has already moved on and will not resend them.
+var stateOnlyEvents = map[string]bool{
+	"session.end":            true,
+	"context.compact.before": true,
+	"subagent.start":         true,
+	"subagent.stop":          true,
+}
+
+// respond is the decision body Handle drains on its goroutine. The context
+// checks bound the store work it STARTS: once the hook deadline has passed, the
+// response can no longer reach the host, so pending store writes are skipped
+// instead of queued behind the wedged store connection. Work already in flight
+// still finishes (idempotent writes, single-connection ordering), and
+// stateOnlyEvents run even on a dead budget so, for one, a session the host
+// ended is always archived.
+func (r *Runtime) respond(ctx context.Context, request Request) (Response, error) {
+	started := time.Now()
+	if err := ctx.Err(); err != nil && !stateOnlyEvents[request.Event.Type] {
+		return Response{}, err
+	}
 	if request.ProtocolVersion != ProtocolVersion {
 		return Response{}, fmt.Errorf("native runtime: unsupported protocol version %d", request.ProtocolVersion)
 	}
@@ -259,6 +354,7 @@ func (r *Runtime) Handle(_ context.Context, request Request) (Response, error) {
 		r.activeSessions[request.Session.ID] = activity
 	}
 	r.mu.Unlock()
+	r.pruneRepositoryState()
 	response := Response{
 		ProtocolVersion: ProtocolVersion,
 		PolicyMode:      policyMode,
@@ -269,6 +365,9 @@ func (r *Runtime) Handle(_ context.Context, request Request) (Response, error) {
 		DecisionID:      decisionID(request, request.Event.Type),
 	}
 	err = nil
+	if r.OnTurnStart != nil && (request.Event.Type == "session.start" || request.Event.Type == "prompt.submit") {
+		r.OnTurnStart()
+	}
 	switch request.Event.Type {
 	case "session.start":
 		if features.repository {
@@ -317,9 +416,16 @@ func (r *Runtime) Handle(_ context.Context, request Request) (Response, error) {
 	if err != nil {
 		return Response{}, err
 	}
-	response.RuntimeUS = time.Since(started).Microseconds()
-	if err := r.recordDecision(request, response); err != nil {
-		return Response{}, err
+	// Past the deadline the response never reaches the host, so skip the
+	// decision record instead of queueing more store work behind a wedged
+	// connection. The session.end finalization below still runs on the drain:
+	// a session the host ended must be archived regardless of budget.
+	budgetAlive := ctx.Err() == nil
+	if budgetAlive {
+		response.RuntimeUS = time.Since(started).Microseconds()
+		if err := r.recordDecision(request, response); err != nil {
+			return Response{}, err
+		}
 	}
 	if request.Event.Type == "session.end" && r.receiptDir != "" {
 		receipt, writeErr := r.writeReceipt(request)
@@ -337,17 +443,18 @@ func (r *Runtime) Handle(_ context.Context, request Request) (Response, error) {
 	return response, nil
 }
 
-// sessionLock preserves event order within one session without making unrelated
+// sessionStripe preserves event order within one session without making unrelated
 // coding-agent sessions spend their shared 250 ms hook budget waiting on each
 // other's repository and CCR work. Fixed stripes bound lock memory for a
 // long-lived runtime; hash collisions only serialize, never weaken isolation.
-func (r *Runtime) sessionLock(sessionID string) *sync.Mutex {
+// Each stripe is a one-slot channel: holding it is a value in the buffer.
+func (r *Runtime) sessionStripe(sessionID string) chan struct{} {
 	var hash uint32 = 2166136261
 	for i := 0; i < len(sessionID); i++ {
 		hash ^= uint32(sessionID[i])
 		hash *= 16777619
 	}
-	return &r.sessionLocks[hash%uint32(len(r.sessionLocks))]
+	return r.sessionStripes[hash%uint32(len(r.sessionStripes))]
 }
 
 func directOutputRewriteAgent(agentID string) bool {
@@ -534,7 +641,7 @@ func (r *Runtime) startRepositoryEvidence(request Request) {
 	// was never closed (the warming goroutine below only starts when !exists), so
 	// the next request for that key blocked its waiter forever and
 	// repositoryWarming stayed true for the rest of the session.
-	if r.repositorySessionRefs[request.Session.ID] != "" || r.repositoryWarming[request.Session.ID] {
+	if r.repositorySessionRefs[request.Session.ID].id != "" || r.repositoryWarming[request.Session.ID] {
 		r.repositoryMu.Unlock()
 		return
 	}
@@ -543,6 +650,7 @@ func (r *Runtime) startRepositoryEvidence(request Request) {
 		entry = &repositoryMapEntry{done: make(chan struct{})}
 		r.repositoryMaps[key] = entry
 	}
+	entry.lastAccess.Store(time.Now().UnixNano())
 	r.repositoryWarming[request.Session.ID] = true
 	r.repositoryMu.Unlock()
 
@@ -574,7 +682,7 @@ func (r *Runtime) startRepositoryEvidence(request Request) {
 		if err == nil {
 			var id string
 			r.repositoryMu.Lock()
-			if r.repositoryEnded[request.Session.ID] {
+			if !r.repositoryEnded[request.Session.ID].IsZero() {
 				delete(r.repositoryWarming, request.Session.ID)
 				r.repositoryMu.Unlock()
 				return
@@ -585,7 +693,7 @@ func (r *Runtime) startRepositoryEvidence(request Request) {
 				Currentness: ccr.Current, Lifecycle: ccr.Warm, Data: data,
 			})
 			if err == nil {
-				r.repositorySessionRefs[request.Session.ID] = id
+				r.repositorySessionRefs[request.Session.ID] = repositorySessionRef{id: id, at: time.Now()}
 			}
 			r.repositoryMu.Unlock()
 		}
@@ -597,9 +705,45 @@ func (r *Runtime) startRepositoryEvidence(request Request) {
 
 func (r *Runtime) markRepositorySessionEnded(sessionID string) {
 	r.repositoryMu.Lock()
-	r.repositoryEnded[sessionID] = true
+	r.repositoryEnded[sessionID] = time.Now()
 	delete(r.repositoryWarming, sessionID)
 	r.repositoryMu.Unlock()
+}
+
+// repositoryPruneWindow mirrors the activeSessions lazy-prune window in
+// Handle: repository-evidence bookkeeping for a session or a (CWD,
+// RepositoryState) key untouched this long belongs to nothing still running.
+const repositoryPruneWindow = 30 * time.Minute
+
+// pruneRepositoryState reclaims repositoryEnded, repositorySessionRefs and
+// repositoryMaps entries idle past repositoryPruneWindow. There is no
+// background ticker for this state, same as activeSessions: it only shrinks
+// when the next request drives it.
+func (r *Runtime) pruneRepositoryState() {
+	now := time.Now()
+	r.repositoryMu.Lock()
+	defer r.repositoryMu.Unlock()
+	for sessionID, endedAt := range r.repositoryEnded {
+		if now.Sub(endedAt) >= repositoryPruneWindow {
+			delete(r.repositoryEnded, sessionID)
+			delete(r.repositorySessionRefs, sessionID)
+		}
+	}
+	// repositoryEnded is only ever written by session.end, so keying the ref
+	// prune off it alone retains a ref forever for any host that disappeared
+	// without sending one. Prune by idleness too, exactly as the activeSessions
+	// sweep in Handle already does for the same reason.
+	for sessionID, ref := range r.repositorySessionRefs {
+		if now.Sub(ref.at) >= repositoryPruneWindow {
+			delete(r.repositorySessionRefs, sessionID)
+			delete(r.repositoryEnded, sessionID)
+		}
+	}
+	for key, entry := range r.repositoryMaps {
+		if now.Sub(time.Unix(0, entry.lastAccess.Load())) >= repositoryPruneWindow {
+			delete(r.repositoryMaps, key)
+		}
+	}
 }
 
 func (r *Runtime) transitionAfterCompaction(sessionID string) error {
@@ -645,13 +789,21 @@ func (r *Runtime) repositoryEvidenceContext(request Request) (string, string, er
 	}
 	r.startRepositoryEvidence(request)
 	key := repositoryKey(request.Session)
-	r.repositoryMu.RLock()
+	r.repositoryMu.Lock()
 	entry := r.repositoryMaps[key]
-	mapRef := r.repositorySessionRefs[request.Session.ID]
-	r.repositoryMu.RUnlock()
+	ref := r.repositorySessionRefs[request.Session.ID]
+	mapRef := ref.id
+	// Touch on read as well as on write: a live session that keeps asking for
+	// evidence must never have its own ref pruned out from under it.
+	if mapRef != "" {
+		ref.at = time.Now()
+		r.repositorySessionRefs[request.Session.ID] = ref
+	}
+	r.repositoryMu.Unlock()
 	if entry == nil {
 		return "Caveman repository evidence: unavailable; no path claims injected.", "", nil
 	}
+	entry.lastAccess.Store(time.Now().UnixNano())
 	select {
 	case <-entry.done:
 		r.repositoryMu.RLock()
@@ -1077,6 +1229,14 @@ func repositoryStateMatches(observed, current string) bool {
 	return current != "" && observed == current
 }
 
+// minMaskBytes is the smallest tool output worth replacing with a content-free
+// handle (#1365). The agent usually needs the content back, and redeeming the
+// handle costs a whole extra model request that re-reads the cached context,
+// which outweighs writing a few KB once. 4096 matches the Hermes shrink floor
+// (CAVE_HERMES_SHRINK_MIN_BYTES). Smaller outputs are still captured, so the
+// handle stays valid, and pass through unchanged.
+const minMaskBytes = 4096
+
 func (r *Runtime) afterTool(request Request, response Response, allowMask bool) (Response, error) {
 	if request.Tool == nil {
 		return response, nil
@@ -1124,11 +1284,12 @@ func (r *Runtime) afterTool(request Request, response Response, allowMask bool) 
 	// answering. Naming the tool and the exact argument turns a dead end into one
 	// call.
 	replacement := fmt.Sprintf(
-		"[%s]\nstatus: current\nsource: %s\nfull: %s\nrecover: call caveman_retrieve with recovery_handle=%q to get these bytes back in full — one call returns the entire original.",
+		"[%s]\nstatus: current\nsource: %s\nfull: %s\nrecover: call caveman_retrieve with only recovery_handle=%q to get these bytes back in full — one call returns the entire original. Adding a query returns only a matching excerpt.",
 		typeName, source, response.RecoveryRef, response.RecoveryRef)
 	// Mask only when replacement plus one retrieval call and safety margin is
 	// materially smaller. Bytes are conservative proxy for tokenizer variance.
-	if allowMask && len(request.Tool.Output) > len(replacement)+256+128 &&
+	if allowMask && len(request.Tool.Output) >= minMaskBytes &&
+		len(request.Tool.Output) > len(replacement)+256+128 &&
 		!r.maskWouldDiscardFacts(request.Tool.Output) {
 		response.OutputReplacement = replacement
 		if err := r.store.SetObjectLifecycle(id, ccr.Warm); err != nil {
@@ -1164,7 +1325,9 @@ func (r *Runtime) afterTool(request Request, response Response, allowMask bool) 
 //
 // Only classes with a field grammar qualify, because only those produce
 // invariants: JSON records, CSV/TSV/markdown rows, and line-oriented logs
-// (logfmt and NDJSON both, via the log compressor's per-line reader). Everything
+// (logfmt and NDJSON both, via the log compressor's per-line reader), plus test
+// reports, whose compressor keeps every failure and the counts (pytest/Jest JSON
+// took this path as plain JSON before test-report existed). Everything
 // else — text, code, diff, terminal, HTML, config, search results, and anything
 // undetected — keeps today's masking behaviour exactly.
 //
@@ -1175,7 +1338,7 @@ func (r *Runtime) maskWouldDiscardFacts(output []byte) bool {
 		return false // cannot classify -> behave exactly as before
 	}
 	switch r.detect(output) {
-	case engine.TypeJSON, engine.TypeTabular, engine.TypeLog:
+	case engine.TypeJSON, engine.TypeTabular, engine.TypeLog, engine.TypeTestReport:
 		return true
 	default:
 		return false
@@ -1202,6 +1365,7 @@ func (r *Runtime) captureTestImpact(request Request, changedPath string) {
 	if entry == nil {
 		return
 	}
+	entry.lastAccess.Store(time.Now().UnixNano())
 	select {
 	case <-entry.done:
 		r.repositoryMu.RLock()

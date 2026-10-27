@@ -710,7 +710,7 @@ func TestSessionEndWritesHonestReceiptOutsideModelContext(t *testing.T) {
 		CostBasis: "catalog_list_price_subtotal_provider_complete_priced_rows", SavingsBasis: "inferred_standalone_not_verified",
 	}})
 	session := Session{ID: "claude:host-9", HostSessionID: "host-9"}
-	large := []byte(strings.Repeat("safe result\n", 300))
+	large := []byte(strings.Repeat("safe result\n", 400))
 	if _, err := runtime.Handle(context.Background(), Request{
 		ProtocolVersion: 1,
 		Agent:           Agent{ID: "claude"},
@@ -872,7 +872,7 @@ func TestDeferredMaskIsInjectedOnceForHostsWithoutDirectOutputRewrite(t *testing
 	defer store.Close()
 	runtime := New(store)
 	session := Session{ID: "codex:deferred-mask"}
-	large := []byte(strings.Repeat("bounded output\n", 200))
+	large := []byte(strings.Repeat("bounded output\n", 300))
 	after, err := runtime.Handle(context.Background(), Request{
 		ProtocolVersion: 1, PolicyMode: "safe", Profile: "full-safe", Agent: Agent{ID: "codex"},
 		Session: session, Event: Event{Type: "tool.after"},
@@ -1470,5 +1470,169 @@ func TestPersistentRuntimePrunesAbandonedCorrelationEntries(t *testing.T) {
 	}
 	if active, _ := r.IdleSnapshot(); active != 2 {
 		t.Fatalf("active correlation entries = %d, want recent and new", active)
+	}
+}
+
+func TestRepositoryStatePrunedAfterIdleWindow(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "handler.go"), []byte("package main\n\nfunc Serve() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store, err := ccr.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	r := New(store)
+
+	start := func(sessionID, repoState string) Session {
+		session := Session{ID: sessionID, CWD: root, RepositoryState: repoState}
+		if _, err := r.Handle(context.Background(), Request{
+			ProtocolVersion: 1, PolicyMode: "safe", Profile: "full-safe", Agent: Agent{ID: "claude"},
+			Session: session, Event: Event{Type: "session.start"},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		waitForRepositoryMap(t, store, sessionID)
+		if _, err := r.Handle(context.Background(), Request{
+			ProtocolVersion: 1, PolicyMode: "safe", Profile: "full-safe", Agent: Agent{ID: "claude"},
+			Session: session, Event: Event{Type: "session.end"},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return session
+	}
+
+	stale := start("stale-session", "git:stale")
+	recent := start("recent-session", "git:recent")
+	staleKey := repositoryKey(stale)
+	recentKey := repositoryKey(recent)
+
+	// Backdate only the stale session, same as activeSessions above. The recent
+	// session stays untouched as the positive control.
+	r.repositoryMu.Lock()
+	entry, ok := r.repositoryMaps[staleKey]
+	if !ok {
+		r.repositoryMu.Unlock()
+		t.Fatal("stale session has no repositoryMaps entry to age")
+	}
+	entry.lastAccess.Store(time.Now().Add(-2 * repositoryPruneWindow).UnixNano())
+	r.repositoryEnded[stale.ID] = time.Now().Add(-2 * repositoryPruneWindow)
+	r.repositoryMu.Unlock()
+
+	// Drive one more request so Handle's lazy prune runs; there is no
+	// background ticker for this state, mirroring activeSessions.
+	if _, err := r.Handle(context.Background(), Request{
+		ProtocolVersion: 1, Agent: Agent{ID: "claude", Surface: "cli"},
+		Session: Session{ID: "unrelated-poke"}, Event: Event{Type: "prompt.submit"}, PolicyMode: "record",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	r.repositoryMu.RLock()
+	_, staleEndedThere := r.repositoryEnded[stale.ID]
+	_, staleRefThere := r.repositorySessionRefs[stale.ID]
+	_, staleMapThere := r.repositoryMaps[staleKey]
+	_, recentEndedThere := r.repositoryEnded[recent.ID]
+	_, recentRefThere := r.repositorySessionRefs[recent.ID]
+	_, recentMapThere := r.repositoryMaps[recentKey]
+	r.repositoryMu.RUnlock()
+
+	if staleEndedThere || staleRefThere || staleMapThere {
+		t.Fatalf("stale repository-evidence bookkeeping not pruned: ended=%v ref=%v map=%v",
+			staleEndedThere, staleRefThere, staleMapThere)
+	}
+	if !recentEndedThere || !recentRefThere || !recentMapThere {
+		t.Fatalf("recent repository-evidence bookkeeping incorrectly pruned: ended=%v ref=%v map=%v",
+			recentEndedThere, recentRefThere, recentMapThere)
+	}
+}
+
+// A host can disappear without ever sending session.end. repositoryEnded is
+// only written by session.end, so a ref prune keyed off it alone keeps one
+// entry per abandoned session forever — the same failure mode the activeSessions
+// sweep in Handle already guards against.
+func TestAbandonedSessionRepositoryRefsPrunedAfterIdleWindow(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "handler.go"), []byte("package main\n\nfunc Serve() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store, err := ccr.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	r := New(store)
+
+	start := func(sessionID, repoState string) {
+		session := Session{ID: sessionID, CWD: root, RepositoryState: repoState}
+		if _, err := r.Handle(context.Background(), Request{
+			ProtocolVersion: 1, PolicyMode: "safe", Profile: "full-safe", Agent: Agent{ID: "claude"},
+			Session: session, Event: Event{Type: "session.start"},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		waitForRepositoryMap(t, store, sessionID)
+		// Deliberately no session.end.
+	}
+	start("abandoned-session", "git:abandoned")
+	start("live-session", "git:live")
+
+	// Age only the abandoned session's ref. The live session is the positive
+	// control: a ref must never be pruned out from under a session still asking.
+	r.repositoryMu.Lock()
+	ref, ok := r.repositorySessionRefs["abandoned-session"]
+	if !ok {
+		r.repositoryMu.Unlock()
+		t.Fatal("abandoned session has no repositorySessionRefs entry to age")
+	}
+	ref.at = time.Now().Add(-2 * repositoryPruneWindow)
+	r.repositorySessionRefs["abandoned-session"] = ref
+	r.repositoryMu.Unlock()
+
+	if _, err := r.Handle(context.Background(), Request{
+		ProtocolVersion: 1, Agent: Agent{ID: "claude", Surface: "cli"},
+		Session: Session{ID: "unrelated-poke"}, Event: Event{Type: "prompt.submit"}, PolicyMode: "record",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	r.repositoryMu.RLock()
+	_, abandonedThere := r.repositorySessionRefs["abandoned-session"]
+	_, liveThere := r.repositorySessionRefs["live-session"]
+	r.repositoryMu.RUnlock()
+	if abandonedThere {
+		t.Fatal("repositorySessionRefs retained for a session that never sent session.end")
+	}
+	if !liveThere {
+		t.Fatal("repositorySessionRefs pruned for a session still inside the idle window")
+	}
+}
+
+// A session or prompt start runs OnTurnStart (the Cloud link warms its route
+// path before the model request); no other event does.
+func TestTurnStartsRunOnTurnStart(t *testing.T) {
+	store, err := ccr.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	runtime := New(store)
+	var starts []string
+	event := ""
+	runtime.OnTurnStart = func() { starts = append(starts, event) }
+	for _, event = range []string{"session.start", "tool.before", "prompt.submit", "turn.stop", "session.end"} {
+		if _, err := runtime.Handle(context.Background(), Request{
+			ProtocolVersion: 1, PolicyMode: "record",
+			Agent:   Agent{ID: "codex", Version: "1.0", Surface: "cli"},
+			Session: Session{ID: "s1", CWD: "/repo"},
+			Event:   Event{Type: event},
+			Tool:    &Tool{Name: "Bash"},
+		}); err != nil {
+			t.Fatalf("%s: %v", event, err)
+		}
+	}
+	if got := strings.Join(starts, ","); got != "session.start,prompt.submit" {
+		t.Fatalf("OnTurnStart ran on %q", got)
 	}
 }

@@ -23,9 +23,10 @@ const ElidedKey = "__caveman_elided__"
 const ElidedInvariantsKey = "__caveman_invariants__"
 
 // ElidedNoteKey carries the one-per-payload contract line telling the model how
-// to read an elided view. It rides on the FIRST elision marker of the payload
-// (document order) because a JSON payload has no trailing line to append to, and
-// adding a synthetic root key would change the shape the model parses.
+// to read an elided view. When emitted, it rides on the first elision marker in
+// canonical traversal order (lexicographic object keys, original array order).
+// A JSON payload has no trailing line to append to, and adding a synthetic root
+// key would change the shape the model parses.
 const ElidedNoteKey = "__caveman_note__"
 
 // errorKeyRe matches object keys whose subtrees carry signal the model needs —
@@ -112,8 +113,15 @@ func (c *jsonCompressor) transform(v any, preserve bool, query string, collapsed
 	switch t := v.(type) {
 	case map[string]any:
 		m := make(map[string]any, len(t))
-		for k, val := range t {
-			m[k] = c.transform(val, preserve || errorKeyRe.MatchString(k), query, collapsed)
+		// Siblings share collapsed, so traversal order decides where the one
+		// payload note goes. Canonicalize before transforming, not just marshaling.
+		keys := make([]string, 0, len(t))
+		for k := range t {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			m[k] = c.transform(t[k], preserve || errorKeyRe.MatchString(k), query, collapsed)
 		}
 		return m
 	case []any:
@@ -377,8 +385,29 @@ func anomalyIndices(arr []any, docs []string, zThresh float64) map[int]bool {
 		if scale <= 0 {
 			continue
 		}
+		// Element length only: a length shared by more than a tenth of the series
+		// is a level the data regularly takes, not an outlier. A categorical field
+		// cycling through a few values moves element length in lockstep, and two
+		// adjacent levels collapse the MAD so the third reads as z≫2 — which
+		// force-kept a third of every such array. Real numeric leaves keep the
+		// plain z rule: a common value there (a cluster of 503s at a 30000ms
+		// timeout) is exactly what a reader needs to see.
+		// A level also has to be roughly as common as the most common one: cycling
+		// levels are near-equal in size, a minority state (a fixed-width
+		// rollback_required row in 12% of the array) is not, and stays flagged.
+		var counts map[float64]int
+		rare := len(series)
+		if p == "__len__" {
+			counts = make(map[float64]int, len(series))
+			mode := 0
+			for _, v := range series {
+				counts[v]++
+				mode = max(mode, counts[v])
+			}
+			rare = max(len(series)/10, mode/2, 2)
+		}
 		for j, v := range series {
-			if math.Abs(0.6745*(v-med)/scale) >= zThresh {
+			if counts[v] <= rare && math.Abs(0.6745*(v-med)/scale) >= zThresh {
 				flags[idxs[j]] = true
 			}
 		}

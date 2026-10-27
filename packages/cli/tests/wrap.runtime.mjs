@@ -725,6 +725,43 @@ test("wrap opencode never writes the user's opencode config", async () => {
   assert.equal(readFileSync(userCfg, "utf8"), sentinel, "the user's opencode.json must be left byte-for-byte unchanged");
 });
 
+// The session wrap replaces the agent's endpoint, and the proxy forwards to the
+// provider's public API only, so an endpoint of the user's own (a gateway,
+// LiteLLM) and its key would go there. The wrap launches such an agent directly.
+test("wrap launches codex, opencode and gemini directly when they use their own endpoint", async () => {
+  const { mkdtempSync, writeFileSync, mkdirSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const dir = mkdtempSync(join(tmpdir(), "cave-wrap-own-"));
+  const direct = /points at your own endpoint .*, which the proxy cannot forward to; launching directly/;
+  // Codex: a provider of the user's own in config.toml.
+  const codexHome = join(dir, "codex");
+  mkdirSync(codexHome);
+  writeFileSync(join(codexHome, "config.toml"), 'model_provider = "corp"\n\n[model_providers.corp]\nname = "Corp"\nbase_url = "https://litellm.corp.example/v1"\nenv_key = "OPENAI_API_KEY"\n');
+  const codex = await wrapAndEchoEnvJson("codex", ["CODEX_HOME"], { CODEX_HOME: codexHome, OPENAI_API_KEY: "sk-corp" });
+  assert.equal(codex.code, 0, codex.stderr);
+  assert.equal(JSON.parse(codex.stdout).CODEX_HOME, codexHome, "Codex must keep the user's own home");
+  assert.match(codex.stderr, /model_provider in \S+config\.toml points at your own endpoint corp/);
+  // OpenCode: a provider baseURL in its global config; the wrap's inline config merges last.
+  const xdg = join(dir, "xdg");
+  mkdirSync(join(xdg, "opencode"), { recursive: true });
+  writeFileSync(join(xdg, "opencode", "config.json"), JSON.stringify({ provider: { anthropic: { options: { baseURL: "https://litellm.corp.example" } } } }));
+  const opencode = await wrapAndEchoEnvJson("opencode", ["OPENCODE_CONFIG_CONTENT"], { XDG_CONFIG_HOME: xdg });
+  assert.equal(opencode.code, 0, opencode.stderr);
+  assert.equal(JSON.parse(opencode.stdout).OPENCODE_CONFIG_CONTENT, null);
+  assert.match(opencode.stderr, direct);
+  // Gemini: the shell's base URL, and the one in ~/.gemini/.env.
+  const gemini = await wrapAndEchoEnvJson("gemini", ["GOOGLE_GEMINI_BASE_URL"], { GOOGLE_GEMINI_BASE_URL: "https://llm-gw.corp.example/gemini" });
+  assert.equal(gemini.code, 0, gemini.stderr);
+  assert.equal(JSON.parse(gemini.stdout).GOOGLE_GEMINI_BASE_URL, "https://llm-gw.corp.example/gemini");
+  assert.match(gemini.stderr, direct);
+  mkdirSync(join(dir, ".gemini"));
+  writeFileSync(join(dir, ".gemini", ".env"), "GOOGLE_GEMINI_BASE_URL=https://llm-gw.corp.example/gemini\n");
+  const fromEnvFile = await wrapAndEchoEnvJson("gemini", ["GOOGLE_GEMINI_BASE_URL"], { GEMINI_CLI_HOME: dir });
+  assert.equal(fromEnvFile.code, 0, fromEnvFile.stderr);
+  assert.equal(JSON.parse(fromEnvFile.stdout).GOOGLE_GEMINI_BASE_URL, null);
+  assert.match(fromEnvFile.stderr, direct);
+});
+
 // `caveman mcp install <agent>` registers the caveman MCP server in the agent's
 // own config (so it can recover proxy-elided detail) and records a marker wrap
 // reads. For codex it writes a [mcp_servers.caveman] block to ~/.codex/config.toml.
@@ -986,6 +1023,38 @@ test("Claude remote-control launches direct because Claude Code refuses a proxie
   );
   const env = buildWrapEnv(claude, "http://127.0.0.1:8787", "auto", ["-p", "hello"]);
   assert.equal(env.ANTHROPIC_BASE_URL, "http://127.0.0.1:8787/w/claude");
+});
+
+test("Claude remote-control is a flag, not only a subcommand (#1101)", async () => {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const { buildWrapEnv } = await import(`${pathToFileURL(join(here, "..", "dist", "index.js")).href}?claude-remote-control-flag`);
+  const claude = PROFILES.find((profile) => profile.id === "claude");
+  // Claude Code spells Remote Control `--remote-control [name]`; the bare
+  // `remote-control` word the original guard matched is the legacy subcommand.
+  // Both must bypass the proxy, or the host refuses the session outright.
+  for (const argv of [
+    ["--remote-control"],
+    ["--remote-control", "mybox"],
+    ["--remote-control=mybox"],
+    ["--dangerously-skip-permissions", "--remote-control"],
+  ]) {
+    assert.throws(
+      () => buildWrapEnv(claude, "http://127.0.0.1:8787", "auto", argv),
+      /Claude Code remote-control only runs against api.anthropic.com/,
+      `expected ${argv.join(" ")} to launch direct`,
+    );
+  }
+  // Naming the prefix does not turn Remote Control on, so it must keep routing
+  // through the proxy — bypassing here would silently drop compression.
+  for (const argv of [
+    ["-p", "remote-control"],
+    ["--remote-control-session-name-prefix", "laptop", "-p", "hi"],
+    ["--remote-control-session-name-prefix=laptop", "-p", "hi"],
+    ["-p", "write a --remote-control guide"],
+  ]) {
+    const routed = buildWrapEnv(claude, "http://127.0.0.1:8787", "auto", argv);
+    assert.equal(routed.ANTHROPIC_BASE_URL, "http://127.0.0.1:8787/w/claude", `expected ${argv.join(" ")} to stay routed`);
+  }
 });
 
 test("a corporate HTTPS_PROXY does not swallow the agent's loopback hop (#1001)", async () => {

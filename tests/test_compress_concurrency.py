@@ -22,7 +22,7 @@ class LockPathTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {"XDG_DATA_HOME": data_home, "LOCALAPPDATA": data_home}):
                 target_dir = Path(tmp) / "sub"
                 target_dir.mkdir()
-                (target_dir / "task.md").write_text("x")
+                (target_dir / "task.md").write_text("x", encoding="utf-8")
                 resolved = (target_dir / "task.md").resolve()
                 relative_cwd = os.getcwd()
                 try:
@@ -48,16 +48,46 @@ class LockPathTests(unittest.TestCase):
                 b = compress_mod.lock_path_for(Path("/repo-a/docs/other.md"))
                 self.assertNotEqual(a, b)
 
-    def test_same_parent_dir_name_and_stem_share_lock_path(self):
-        # backup_dir_for keys its own collision guard on parent-dir-name + stem only (not the full path); the lock must share that domain or both processes can pass the "backup already exists" guard before either has written. task.md vs task.txt is the sharpest real case: same stem, same backup filename, different source extension.
+    def test_same_dir_and_stem_share_lock_path(self):
+        # Two files that still map to ONE backup file — same directory, same stem,
+        # different extension — must share a lock, or both processes pass the
+        # "backup already exists" guard before either has written.
         with tempfile.TemporaryDirectory() as data_home:
             with mock.patch.dict(os.environ, {"XDG_DATA_HOME": data_home, "LOCALAPPDATA": data_home}):
                 a = compress_mod.lock_path_for(Path("/repo-a/docs/task.md"))
-                b = compress_mod.lock_path_for(Path("/repo-b/docs/task.txt"))
+                b = compress_mod.lock_path_for(Path("/repo-a/docs/task.txt"))
                 self.assertEqual(a, b)
                 backup_a = compress_mod.backup_dir_for(Path("/repo-a/docs/task.md")) / "task.original.md"
-                backup_b = compress_mod.backup_dir_for(Path("/repo-b/docs/task.txt")) / "task.original.md"
+                backup_b = compress_mod.backup_dir_for(Path("/repo-a/docs/task.txt")) / "task.original.md"
                 self.assertEqual(backup_a, backup_b)
+
+    def test_same_dir_name_in_different_projects_do_not_collide(self):
+        # #1351: backup_dir_for keyed on filepath.parent.NAME, so every project's
+        # .claude/CLAUDE.md mapped to one backups/.claude/CLAUDE.original.md. The
+        # second project aborted on the first's backup, and the abort's own advice
+        # ("remove the backup") deleted another project's only uncompressed original.
+        with tempfile.TemporaryDirectory() as data_home:
+            with mock.patch.dict(os.environ, {"XDG_DATA_HOME": data_home, "LOCALAPPDATA": data_home}):
+                home = Path("/home/u/.claude/CLAUDE.md")
+                repo = Path("/some/repo/.claude/CLAUDE.md")
+                backup_home = compress_mod.backup_dir_for(home) / "CLAUDE.original.md"
+                backup_repo = compress_mod.backup_dir_for(repo) / "CLAUDE.original.md"
+                self.assertNotEqual(backup_home, backup_repo)
+                # The lock domain is derived from the backup path, so it must split too.
+                self.assertNotEqual(
+                    compress_mod.lock_path_for(home), compress_mod.lock_path_for(repo)
+                )
+
+    def test_backup_dir_is_stable_however_the_path_is_spelled(self):
+        # The key is the resolved parent, so an unresolved spelling of the same
+        # file must not get a second, separate backup slot.
+        with tempfile.TemporaryDirectory() as data_home, tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ, {"XDG_DATA_HOME": data_home, "LOCALAPPDATA": data_home}):
+                direct = Path(tmp) / "docs" / "task.md"
+                indirect = Path(tmp) / "docs" / ".." / "docs" / "task.md"
+                self.assertEqual(
+                    compress_mod.backup_dir_for(direct), compress_mod.backup_dir_for(indirect)
+                )
 
 
 class FileLockTests(unittest.TestCase):
@@ -135,13 +165,13 @@ class FileLockTests(unittest.TestCase):
                 lock_path = compress_mod.lock_path_for(target)
                 lock_path.parent.mkdir(parents=True, exist_ok=True)
                 decoy = Path(tmp) / "decoy"
-                decoy.write_text("do not touch")
+                decoy.write_text("do not touch", encoding="utf-8")
                 lock_path.symlink_to(decoy)
 
                 with self.assertRaises(OSError):
                     with compress_mod.file_lock(target):
                         pass  # pragma: no cover - must never be reached
-                self.assertEqual(decoy.read_text(), "do not touch")
+                self.assertEqual(decoy.read_text(encoding="utf-8"), "do not touch")
 
     @unittest.skipIf(compress_mod._IS_WINDOWS, "creating dir symlinks needs elevated privilege on Windows")
     def test_refuses_when_lock_dir_itself_is_a_symlink(self):
@@ -284,7 +314,7 @@ class CompressFileLockIntegrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as data_home:
             with mock.patch.dict(os.environ, {"XDG_DATA_HOME": data_home, "LOCALAPPDATA": data_home}):
                 sensitive = Path(tmp) / "id_rsa"
-                sensitive.write_text("fake key material")
+                sensitive.write_text("fake key material", encoding="utf-8")
                 with self.assertRaises(ValueError):
                     compress_mod.compress_file(sensitive)
                 self.assertFalse(compress_mod._state_base_dir("locks").exists())

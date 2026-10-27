@@ -58,6 +58,18 @@ function compatTarget(base: URL, path: string): string {
   return base.origin + '/' + [...left, ...right.slice(overlap)].join('/');
 }
 
+export function verifiedChatGPTSubscriptionRoute(
+  gateway: string, api: string | undefined, provider: string,
+  originalBaseUrl: string | undefined, published?: PublishedUpstreams,
+): string | undefined {
+  if (api !== 'openai-codex-responses' || provider !== 'openai-codex') return undefined;
+  const original = endpoint(originalBaseUrl);
+  const upstream = endpoint(published?.provider_upstreams?.['openai-codex']);
+  if (!original || !upstream || !endpoint(gateway)) return undefined;
+  if (append(upstream, '/codex/responses') !== append(original, '/codex/responses')) return undefined;
+  return trimTrailingSlashes(gateway);
+}
+
 export function verifiedProviderRoute(
   gateway: string, api: string | undefined, provider: string,
   originalBaseUrl: string | undefined, published?: PublishedUpstreams,
@@ -77,9 +89,16 @@ export function verifiedProviderRoute(
   if (mount !== undefined) {
     const upstream = endpoint(mount);
     if (!upstream || family === 'gemini') return undefined;
-    const suffix = family === 'openai' ? '/v1' : '';
-    if (compatTarget(upstream, suffix + operation) !== expected) return undefined;
-    return trimTrailingSlashes(gateway) + `/compat/${provider}${suffix}`;
+    // A mount forwards any path after /compat/<name>, so an OpenAI base with no
+    // /v1 (DeepSeek's api.deepseek.com, Z.ai's .../paas/v4) is served without
+    // one. Trying /v1 first keeps every route that verified before unchanged.
+    const suffixes = family === 'openai' ? ['/v1', ''] : [''];
+    for (const suffix of suffixes) {
+      if (compatTarget(upstream, suffix + operation) === expected) {
+        return trimTrailingSlashes(gateway) + `/compat/${provider}${suffix}`;
+      }
+    }
+    return undefined;
   }
   const upstream = endpoint(published?.provider_upstreams?.[family]);
   if (!upstream) return undefined;

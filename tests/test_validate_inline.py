@@ -10,9 +10,46 @@ from scripts.validate import (  # noqa: E402
     ValidationResult,
     extract_code_blocks,
     extract_inline_codes,
+    extract_paths,
+    extract_urls,
     validate,
     validate_inline_codes,
 )
+
+
+class TestUrlInBackticks(unittest.TestCase):
+    """A backtick is never a URL character; a URL in inline code used to be
+    extracted with the closing backtick glued on (#163)."""
+
+    def test_trailing_backtick_not_part_of_url(self):
+        self.assertEqual(extract_urls("see `https://x.io/a` now"), {"https://x.io/a"})
+
+
+class TestTrailingPunctuation(unittest.TestCase):
+    """#1353: punctuation right after a URL or path was extracted as part of it,
+    so a reply that only moved a comma or period failed validation."""
+
+    def test_trailing_punctuation_not_part_of_url(self):
+        self.assertEqual(
+            extract_urls("See https://docs.example.com/billing/v2, then https://x.io/a."),
+            {"https://docs.example.com/billing/v2", "https://x.io/a"},
+        )
+
+    def test_trailing_punctuation_not_part_of_path(self):
+        self.assertEqual(extract_paths("Read docs/runbook.md. Then ./run.sh!"), {"docs/runbook.md", "./run.sh"})
+
+    def test_dot_inside_path_kept(self):
+        self.assertEqual(extract_paths("Edit src/app.config.ts"), {"src/app.config.ts"})
+
+    def test_moved_comma_and_period_validate(self):
+        orig = "# T\n\nSee https://docs.example.com/billing/v2 and docs/runbook.md for details.\n"
+        comp = "# T\n\nSee https://docs.example.com/billing/v2, docs/runbook.md.\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            o, c = Path(tmp) / "a.original.md", Path(tmp) / "a.md"
+            o.write_text(orig, encoding="utf-8")
+            c.write_text(comp, encoding="utf-8")
+            result = validate(o, c)
+        self.assertTrue(result.is_valid, result.errors)
 
 
 class TestIndentedFence(unittest.TestCase):
@@ -101,6 +138,32 @@ class TestMultiLineSpansStillCompared(unittest.TestCase):
         self.assertFalse(result.is_valid, "a changed CLI argument must not pass as a warning")
 
 
+class TestMidLineFenceRun(unittest.TestCase):
+    """A backtick run in the MIDDLE of a prose line ("inside a ```diff fence")
+    is matched by neither FENCE_OPEN_REGEX nor FENCE_MARKER_LINE_REGEX, so its
+    backticks used to leak into inline-code pairing. The naive `([^`]+)`
+    pattern then opened a span at the run's trailing backtick and closed it at
+    the NEXT real span's opening backtick, shifting every following pair and
+    making the file permanently uncompressible."""
+
+    def test_midline_triple_backtick_does_not_shift_pairing(self):
+        text = "Put the result inside a ```diff fence. Then state:\n\n- count of `BEGIN PRIVATE KEY` matches\n- check `base64 -d` output\n"
+        self.assertEqual(extract_inline_codes(text), ["BEGIN PRIVATE KEY", "base64 -d"])
+
+    def test_midline_run_file_validates_against_itself(self):
+        text = "Wrap it in a ```json fence and run `jq .` after.\n"
+        result = ValidationResult()
+        validate_inline_codes(text, text, result)
+        self.assertTrue(result.is_valid, result.errors)
+
+    def test_span_after_midline_run_still_protected(self):
+        orig = "Use a ```diff fence, then run `git apply /tmp/x.patch` to apply.\n"
+        comp = "Use a ```diff fence, then apply.\n"
+        result = ValidationResult()
+        validate_inline_codes(orig, comp, result)
+        self.assertFalse(result.is_valid, "span dropped after a mid-line run must be caught")
+
+
 class TestErrorRendering(unittest.TestCase):
     """#820's failures were undiagnosable because a garbled span was printed
     whole. That is a presentation problem — fix it in the message, not by
@@ -155,9 +218,24 @@ class TestValidateIntegration(unittest.TestCase):
             self.assertTrue(any("Inline code lost" in e for e in result.errors))
 
 
-if __name__ == "__main__":
-    unittest.main()
 
+class TestInnerBacktickSpans(unittest.TestCase):
+    """CommonMark lets a span carry a backtick run of another length inside it
+    (``a`b``). A content class that excludes every backtick cannot match such a
+    span at all, so a rewrite of its code went unvalidated."""
+
+    def test_double_backtick_span_with_inner_backtick_is_extracted(self):
+        self.assertEqual(extract_inline_codes("use ``a`b`` here and `c`"), ["a`b", "c"])
+
+    def test_single_backtick_span_with_inner_double_run(self):
+        self.assertEqual(extract_inline_codes("see `a``b` now"), ["a``b"])
+
+    def test_inner_backtick_span_rewrite_still_fails_validation(self):
+        orig = "# T\n\nRun ``git log --format=`%h` -1`` first.\n"
+        comp = orig.replace("%h", "%H")
+        result = ValidationResult()
+        validate_inline_codes(orig, comp, result)
+        self.assertFalse(result.is_valid, result.errors)
 
 class TestIndentedCodeIsValidated(unittest.TestCase):
     """A 4-space-indented code block is code. It used to be prose to the
@@ -245,3 +323,7 @@ class TestPreservationPromisesAreErrors(unittest.TestCase):
         orig = "# Hooks\n\nThe shared module lives at src/hooks/caveman-config.js and is required.\n"
         comp = "# Hooks\n\nShared module required.\n"
         self.assertFalse(self._validate(orig, comp).is_valid)
+
+
+if __name__ == "__main__":
+    unittest.main()
